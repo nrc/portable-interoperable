@@ -1,4 +1,4 @@
-# {{INITIATIVE_NAME}} initiative
+# async portability initiative
 <!--
 
  This is the template for creating an initiative in rust-lang. Be sure to go
@@ -32,9 +32,24 @@ https://github.com/rust-lang/infra-team/issues/new
 
 ![initiative status: active](https://img.shields.io/badge/status-active-brightgreen.svg)
 
+## Notes
+
+Key links about async portability.
+
+* [Repo](https://github.com/nrc/portable-interoperable)
+* [Vision roadmap](https://rust-lang.github.io/wg-async-foundations/vision/roadmap/portable.html)
+* [Roadmap goal tracking issue](https://github.com/rust-lang/wg-async-foundations/issues/259)
+* [Roadmap initiative tracking issue](https://github.com/rust-lang/wg-async-foundations/issues/260)
+
+Async foundations issues
+
+(See also status quo story issues)
+
+* [AsyncRead, AsyncWrite traits](https://github.com/rust-lang/wg-async-foundations/issues/23)
+
 ## What is this?
 
-This page tracks the work of the {{INITIATIVE_NAME}} [initiative]! To learn more about what we are trying to do, and to find out the people who are doing it, take a look at the [charter]. 
+This page tracks the work of the async portability [initiative]! To learn more about what we are trying to do, and to find out the people who are doing it, take a look at the [charter]. 
 
 [charter]: ./CHARTER.md
 [initiative]: https://lang-team.rust-lang.org/initiatives.html
@@ -75,10 +90,10 @@ Key:
 * If you are using the feature and would like to provide feedback about your experiences, please [open a "experience report" issue].
 * If you are using the feature and would like to report a bug, please open a regular issue.
 
-We also participate on [{{CHAT_PLATFORM}}][chat-link], feel free to introduce yourself over there and ask us any questions you have.
+We also participate on [Zulip][chat-link], feel free to introduce yourself over there and ask us any questions you have.
 
 [open issues]: /issues
-[chat-link]: {{CHAT_LINK}}
+[chat-link]: https://rust-lang.zulipchat.com/#narrow/stream/187312-wg-async-foundations
 [team-toml]: https://github.com/rust-lang/team/blob/master/teams/initiative-{{INITIATIVE_SLUG}}.toml
 
 ## Building Documentation

@@ -1,6 +1,6 @@
 # Design of async IO traits
 
-Read, Write, Seek, BufRead, ...
+`Read`, `Write`, `Seek`, `BufRead`, ...
 
 See also [issue 5](https://github.com/nrc/portable-interoperable/issues/5).
 
@@ -8,6 +8,20 @@ See also [issue 5](https://github.com/nrc/portable-interoperable/issues/5).
 
 * [Async Read and Write traits](https://ncameron.org/blog/async-read-and-write-traits/)
 * [Async IO with completion-model IO systems](https://ncameron.org/blog/async-io-with-completion-model-io-systems/)
+
+## Requirements
+
+* The traits should be ergonomic to implement and to use
+  - The async traits should be similar to the sync traits, ideally, the two sets of traits should be symmetric. Every concept from the sync versions should be expressible in the async versions.
+* The traits must support vectored reads and writes
+* The traits must support reading into uninitialized memory
+* The traits must support concurrent reading and writing of a single resource
+* The traits should work well as trait objects
+* The traits should work in no_std scenarios
+* The traits must work well both readiness (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
+* When working with completion-based systems, the traits should support zero-copy reads and writes
+* When working with readiness-based systems, the traits should not require access to buffers until IO is ready
+* The traits should permit maximum flexibility of buffers (i.e., buffers should not be constrained to a single concrete type. We should support buffers that are allocated on the stack or owned by other data structures)
 
 ## Read and Write proposal
 
@@ -111,6 +125,106 @@ macro_rules! continue_on_block {
     }
 }
 ```
+
+I haven't included methods for iterating readers (`bytes`, `chain`, `take`), since work on async iterators is ongoing. I leave these for future work and do not believe they should block implementation or stabilisation.
+
+Some rationale:
+
+* The non-blocking read functions are only required for high performance usage and implementation. Therefore, there is no need for variations which take slices of bytes rather than a `ReadBuf` (used for reading into uninitialised memory, see [RFC 2930](https://www.ncameron.org/rfcs/2930)). Converting from a byte slice to a `ReadBuf` is trivial.
+* We elide async functions for vectored reads using byte slices - vectored IO is a high-performance option and the overhead of converting to a `ReadBuf` is trivial, so I don't think it is necessary.
+* The `read_exact` functions are convenience functions and by their nature it does not make sense to have non-blocking variations (c.f., the async functions) since they require multiple reads (and potentially waits).
+
+Note that we expect implementers to implement the provided non-blocking methods in some cases for optimal performance (e.g., for vectored IO). But expect the provided async methods to almost never be overridden. This will be documented.
+
+### Usage - ergonomic path
+
+For the most ergonomic usage, where having the most optimal memory usage is not important, the async IO traits are used just like their sync counterparts. E.g.,
+
+```rust
+use std::async::io::{Read, Result};
+
+async fn read_stream(stream: &TcpStream) -> Result<()> {
+    let mut buf = [0; 1024];
+    let bytes_read = stream.read(&mut buf).await?;
+
+    // we've read bytes_read bytes
+    // do something with buf
+
+    Ok(())
+}
+```
+
+The important thing here is that asynchronous reading is exactly like synchronous reading, it just requires an await (and similarly for writing).
+
+### Usage - memory-sensitive path
+
+Although closely matching the behaviour of synchronous IO is an important ergonomic goal, async IO does have different semantics around timing. Thus for absolutely optimal performance, it requires different usage patterns. In the above usage example, we allocate a buffer to read into, then call read, then await the result. In the sync world we would block until read returns. However, by using async and await we have a non-blocking wait which allows another task to allocate another buffer and await a different read. If we do this hundreds, thousands, or millions of times (which is what we want to be able to do with async IO), then that's a lot of memory allocated in buffers and not doing anything. Better behaviour would be to await the read and only allocate the buffer once the data is ready to be read. In this way we don't have a bunch of memory just sat around. In fact we could then just use a single buffer rather than being forced to allocate new ones!
+
+This usage pattern is facilitated by the `Ready` trait and the `non_blocking_` methods. For this usage, reading might look like:
+
+```rust
+use std::async::io::{continue_on_block, Interest, Read, Ready, Result};
+use std::io::ErrorKind;
+
+async fn read_stream(stream: &TcpStream) -> Result<()> {
+    loop {
+        stream.ready(Interest::READABLE).await?;
+
+        let mut buf = [0; 1024];
+        let bytes_read = continue_on_block!(stream.non_blocking_read(&mut buf)?);
+
+        // we've read bytes_read bytes
+        // do something with buf
+
+        return Ok(());
+    }
+
+    Ok(())
+}
+```
+
+This is less ergonomic than the previous example, but it is more memory-efficient.
+
+### Implementations
+
+Implementers of the IO traits must implement `async::Ready` and either or both of `async::{Read, Write}`. They only need to implement the synchronous `non_blocking` method, the async method is provided (the default implementation follows the memory-sensitive usage example above).
+
+Where possible these traits should be implemented on reference types as well as value types (following the synchronous traits). E.g., all three traits should be implemented for both `TcpStream` and `&TcpStream`. This permits simultaneous reads and writes even when using the ergonomic path (simultaneous read/write is possible in the memory-optimal path without such implementations).
+
+Such implementations are not possible today in some runtimes due details of their waiting implementation. They would be ok with the traits as proposed, since there is no explicit polling.
+
+There is a bit of a foot-gun here because reference implementations make it possible to have multiple simultaneous readers or writers. However, that is somewhat difficult to do unintentionally, is already possible with the sync traits, and is possible even without the reference impls by cloning the underlying handles.
+
+The readiness mechanism using the `Ready` trait is extensible to other readiness notifications in the future. However, this is somewhat complicated since these notifications are nearly all platform-specific. (HUP is not, but requires special handling).
+
+### Requirements discussion
+
+#### Ergonomics
+
+For many users, this proposal will be optimally ergonomic to use. Implementing the IO traits is not ideally ergonomic, but that affects fewer users (and users who tend to be more sophisticated) and is not too bad - there are not too many methods to implement, and those methods have an easily understood purpose which should map well to the OS API. Likewise, for those users who need optimal control or performance, the ergonomics are not great, but such users must expect to be exposed to some details. We can also offer some good helpers to make implementation easier.
+
+I think there is an intrinsic trade-off between wanting to be close to the sync versions for ergonomics and wanting to be close to the underlying IO model for performance and control. I think this proposal is a good compromise point on that trade-off.
+
+#### Vectored reads and writes, and reading into uninitialized memory
+
+These goals are satisfied by the presence of the respective methods and in the same way as for the sync equivalent traits in std.
+
+#### Concurrent reading and writing of a single resource
+
+This works in both API paths (in most cases). In the memory-optimal path because `Ready::ready` can wait on readiness for both reading and writing at the same time. In the ergonomic path, for most resources at least, due to implementations of `Read` and `Write` on reference types.
+
+#### Work well as trait objects
+
+Assuming we get async functions in trait objects working well, the proposed traits work optimally as trait objects. With current plans, that will require some boxing, but that should only be one allocation per read, and only necessary if using trait objects.
+
+#### Work well with completion based systems
+
+Async IO systems which are completion-based, such as IOCP and io_uring will work with this proposal, but will not perform optimally. In particular, the implementation must copy a buffer on every read or write. The optimal way to use completion-based IO is to use the async version of the `BufRead` trait (see below).
+
+The high-level view here is that using `Read`/`Write` will work for any platform, but that for optimal performance the user must choose the buffered or unbuffered traits depending on the platform, not just the constraints of the application. That seems acceptable since for optimal performance, one must always take account of the characteristics of the underlying platform. However, it means the libraries which want to offer excellent performance on all platforms cannot treat buffering as orthogonal and must provide versions of their API using both `Read` and `BufRead` (respectively for `Write`) traits.
+
+
+TODO other requirements
 
 ### Alternatives
 

@@ -372,3 +372,25 @@ In the same way that `&` lets us abstract any borrowing pointer type, `~` would 
 This idea is somewhat similar to some ideas around `dyn*` pointers. It is different to previous `&move` proposals in that `&move` does not call the destructor of the underlying storage on its destruction and thus must be constrained by the lifetime of the storage.
 
 The advantage of this approach is that it works better with trait objects since there is no generic parameter in the `read` method. The disadvantage is that it requires a significant language change.
+
+## Seek
+
+```rust
+pub trait Seek {
+    async fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+
+    async fn rewind(&mut self) -> Result<()> { ... }
+    async fn stream_len(&mut self) -> Result<u64> { ... }
+    async fn stream_position(&mut self) -> Result<u64> { ... }
+}
+```
+
+The async `Seek` trait is a simple `async`-ification of the sync trait.
+
+The `Ready` trait could be extended to support seeking, but I don't think that is necessary. Seek is only useful with buffered readers, files, and similar. In these cases, the memory advantages of using `Ready` are diminished.
+
+There was some discussion about `Seek` in Tokio. One of the key sticking points which led to their `start_seek`/`seek_complete` API was that a future should not have any observable side effects until it is ready, and `poll_seek` method does not satisfy that invariant (since the state of a file might be changed by a seek that did not complete before the seek was cancelled). I believe this is not an issue for async methods, since there can be no assumption of side-effect freedom because polling is encapsulated.
+
+## Extension: `read_at`/`write_at`
+
+`read_at`/`write_at` is arguably a better API than using `seek` and read/write, especially in async programming, because the operation is atomic and therefore not susceptible to race condition errors. However, we should still have an `async::Seek` trait for symmetry with the sync trait, so `read_at`/`write_at` is an extension rather than an alternative.

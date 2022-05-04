@@ -278,6 +278,8 @@ Given how un-ergonomic this approach is, I don't think it is worth pursuing unle
 
 In this alternative, we'd keep the `Ready` trait, but the `Read` and `Write` traits would only have the async methods, not the `non_blocking_` ones. In the common case, the async read would return immediately and the user would not need to handle 'would block' errors. However, since in some cases the user would need to wait for the method to return, one could not share a single buffer between all reads on a thread. Furthermore, these functions couldn't be called from polling functions, or other non-async contexts.
 
+An alternative alternative would be to use the synchronous version of the `Read::read`, rather than `async::Read::non_blocking_read`. That has the right async-ness, but would need to handle 'would block' errors differently, since we would lose asynchronous-ness if we blocked on the `read` call. I don't think that can be done at the moment. It's possible we could do that with some form of async overloading, if we could have sync, async, and non-blocking versions of the same method (though note that that is an extension to the usual proposal for async overloading).
+
 #### `read_ready` and `write_ready` methods rather than a `Ready` trait
 
 This would lead to fewer traits and therefore a simpler API. However, there would be more methods overall (which would lead to code duplication for implementers). The mechanism would not be extensible to other readiness notifications, and it means that a single thread can't concurrently wait for both read and write readiness.
@@ -295,27 +297,31 @@ The approach would work well with completion based IO as well as readiness. Howe
 
 ## `BufRead` proposal
 
+An async `BufRead` trait has two purposes: to support reads with transparent buffering functionality, as in the sync version, and to support completion-model IO where the library manages the buffers. In the former case, an async reader might be wrapped in a `BufReader` (see note below). In the latter case, the IO resource would likely implement `async::BufRead` directly.
+
 ```rust
-trait OwnedRead {
-    async fn read(&mut self, buffer: impl OwnedReadBuf) -> Result<OwnedReadBuf>;
-}
+pub trait BufRead: Read {
+    async fn fill_buf(&mut self) -> Result<&[u8]>;
+    fn consume(&mut self, amt: usize);
 
-trait OwnedReadBuf {
-    fn as_mut_slice(&mut self) -> *mut [u8];
-    unsafe fn assume_init(&mut self, size: usize);
-}
-
-// An implementation using the initialised part of a Vector.
-impl OwnedReadBuf for Vec<u8> {
-    fn as_mut_slice(&mut self) -> *mut [u8] {
-        &mut **self
-    }
-
-    unsafe fn assume_init(&mut self, size: usize) {
-        self.truncate(size);
-    }
+    async fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize> { ... }
+    async fn read_line(&mut self, buf: &mut String) -> Result<usize> { ... }
+    #[unstable]
+    async fn has_data_left(&mut self) -> Result<bool> { ... }
 }
 ```
+
+* `fill_buf` and `consume` are required methods. `consume` does not need to be async since it is just about buffer management, no IO will take place.
+* `has_data_left` must be async since it might fill the buffer to answer the question (it is currently unstable in `BufRead` which is why I've added that annotation).
+* I've elided `split` and `lines` methods since these are async iterators and there are still open questions there. I assume we will add these later. Besides the questions about async iterators, I don't think there is anything too interesting about these methods.
+
+### ` BufReader`
+
+`BufReader` is a concrete type, it's a utility type for converting objects which implement `Read` into objects which implement `BufRead`. I.e., it encapsulates a reader with a buffer to make a reader with an internal buffer. `BufReader` provides its own buffer and does not let the user customise it.
+
+I think that we don't need a separate `async::BufReader` type, but rather we need to duplicate the `impl<R: Read> BufReader<R>` impl for `R: async::Read` and to implement `async::BufRead` where `R: async::Read` (this might be an area where async overloading is useful).
+
+TODO There's also the question of `seek_relative`.
 
 ## Owned read
 
@@ -327,7 +333,7 @@ Strawman design:
 
 ```rust
 trait OwnedRead {
-    async fn read(&mut self, buffer: impl OwnedReadBuf) -> Result<OwnedReadBuf>;
+    async fn read<T: OwnedReadBuf>(&mut self, buffer: impl T) -> Result<T>;
 }
 
 trait OwnedReadBuf {
@@ -348,3 +354,21 @@ impl OwnedReadBuf for Vec<u8> {
 ```
 
 Or add `read` as `owned_read` or `moving_read` or something to `async::Read`.
+
+TODO, we've used `u8` here, but we should probably handle uninitialised data similarly to `ReadBuf`.
+
+### Alternative: an abstract owning pointer type
+
+If the language had an abstract owning pointer type, we could use that rather than the `OwnedReadBuf` trait (using a strawman `~` syntax):
+
+```rust
+trait OwnedRead {
+    async fn read(&mut self, buffer: ~[u8]) -> Result<~[u8]>;
+}
+```
+
+In the same way that `&` lets us abstract any borrowing pointer type, `~` would let us abstract any owning pointer type. `~T` is a pointer to a value of `T` with move semantics and which on destruction calls the destructor for the underlying value and the pointer. Any owning pointer (e.g., `Box<T>`, `Arc<T>`, etc.) can be converted into a `~T`. A `~T` can be downcast into any concrete owning pointer with a runtime check. Similarly, an owning collection can be converted into an owned slice, e.g., `Vec<T>` to `~[T]`. An owning slice can be shrunk like a borrowed slice. We would probably need some mechanism to restore an owned slice. E.g., if a `Vec<T>` is converted to a `~[T]` and then shrunk, we would need some way to restore the original `Vec`.
+
+This idea is somewhat similar to some ideas around `dyn*` pointers. It is different to previous `&move` proposals in that `&move` does not call the destructor of the underlying storage on its destruction and thus must be constrained by the lifetime of the storage.
+
+The advantage of this approach is that it works better with trait objects since there is no generic parameter in the `read` method. The disadvantage is that it requires a significant language change.

@@ -4,6 +4,14 @@
 
 See also [issue 5](https://github.com/nrc/portable-interoperable/issues/5).
 
+TODO:
+
+* Context section
+* Move evaluation of requirements to after all traits
+* Elaborate BufRead/OwnedRead, evaluate against requirements
+* Evaluate Seek against requirements
+* BufWrite/OwnedWrite?
+
 ## Blog posts
 
 * [Async Read and Write traits](https://ncameron.org/blog/async-read-and-write-traits/)
@@ -11,17 +19,32 @@ See also [issue 5](https://github.com/nrc/portable-interoperable/issues/5).
 
 ## Requirements
 
+Not in priority order.
+
 * The traits should be ergonomic to implement and to use
   - The async traits should be similar to the sync traits, ideally, the two sets of traits should be symmetric. Every concept from the sync versions should be expressible in the async versions.
-* The traits must support vectored reads and writes
-* The traits must support reading into uninitialized memory
-* The traits must support concurrent reading and writing of a single resource
-* The traits should work well as trait objects
+* The traits support the same variations as the sync traits
+  - The traits must support vectored reads and writes
+  - The traits must support reading into uninitialized memory
+* Generic usage
+  - The traits must support concurrent reading and writing of a single resource
+  - The traits should work well as trait objects
+* The traits must work performantly with both readiness- (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
+  - When working with completion-based systems, the traits should support zero-copy reads and writes
+  - When working with readiness-based systems, the traits should not require access to buffers until IO is ready
+* The traits should permit maximum flexibility of buffers
+  - buffers should not be constrained to a single concrete type.
+  - We should support buffers that are allocated on the stack or owned by other data structures
 * The traits should work in no_std scenarios
-* The traits must work well both readiness (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
-* When working with completion-based systems, the traits should support zero-copy reads and writes
-* When working with readiness-based systems, the traits should not require access to buffers until IO is ready
-* The traits should permit maximum flexibility of buffers (i.e., buffers should not be constrained to a single concrete type. We should support buffers that are allocated on the stack or owned by other data structures)
+
+## Context: completion and readiness
+
+TODO why async read doesn't fit either model
+
+### Readiness
+
+### Completion
+
 
 ## Read and Write proposal
 
@@ -224,7 +247,7 @@ Async IO systems which are completion-based, such as IOCP and io_uring will work
 The high-level view here is that using `Read`/`Write` will work for any platform, but that for optimal performance the user must choose the buffered or unbuffered traits depending on the platform, not just the constraints of the application. That seems acceptable since for optimal performance, one must always take account of the characteristics of the underlying platform. However, it means the libraries which want to offer excellent performance on all platforms cannot treat buffering as orthogonal and must provide versions of their API using both `Read` and `BufRead` (respectively for `Write`) traits.
 
 
-TODO other requirements
+TODO reorganise; other requirements
 
 ### Alternatives
 
@@ -325,11 +348,9 @@ TODO There's also the question of `seek_relative`.
 
 ## Owned read
 
-See [blog post](https://ncameron.org/blog/async-io-with-completion-model-io-systems/).
+An extension we should consider is permitting reads into owned (rather than borrowed) buffers. We could add either an `OwnedRead` trait or an `owned_read` function to `async::Read`. We would want to do this as well as supporting `async::BufRead`, since the former supports explicitly internal buffers. Owned read is useful for completion-based systems where the user manages the buffers rather than the library or resource. (We can't use borrowed slices due to cancellation).
 
-We could add either an `OwnedRead` trait or an `owned_read` function to `async::Read`.
-
-Strawman design:
+Design with new trait:
 
 ```rust
 trait OwnedRead {
@@ -353,7 +374,7 @@ impl OwnedReadBuf for Vec<u8> {
 }
 ```
 
-Or add `read` as `owned_read` or `moving_read` or something to `async::Read`.
+The alternative is to add `read` as `owned_read` or `moving_read` or similar to `async::Read`.
 
 TODO, we've used `u8` here, but we should probably handle uninitialised data similarly to `ReadBuf`.
 
@@ -391,6 +412,6 @@ The `Ready` trait could be extended to support seeking, but I don't think that i
 
 There was some discussion about `Seek` in Tokio. One of the key sticking points which led to their `start_seek`/`seek_complete` API was that a future should not have any observable side effects until it is ready, and `poll_seek` method does not satisfy that invariant (since the state of a file might be changed by a seek that did not complete before the seek was cancelled). I believe this is not an issue for async methods, since there can be no assumption of side-effect freedom because polling is encapsulated.
 
-## Extension: `read_at`/`write_at`
+### Extension: `read_at`/`write_at`
 
 `read_at`/`write_at` is arguably a better API than using `seek` and read/write, especially in async programming, because the operation is atomic and therefore not susceptible to race condition errors. However, we should still have an `async::Seek` trait for symmetry with the sync trait, so `read_at`/`write_at` is an extension rather than an alternative.

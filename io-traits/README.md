@@ -6,7 +6,6 @@ See also [issue 5](https://github.com/nrc/portable-interoperable/issues/5).
 
 TODO:
 
-* Context section
 * Move evaluation of requirements to after all traits
 * Elaborate BufRead/OwnedRead, evaluate against requirements
 * Evaluate Seek against requirements
@@ -39,11 +38,45 @@ Not in priority order.
 
 ## Context: completion and readiness
 
-TODO why async read doesn't fit either model
+For efficient performance and memory usage, we must understand how async IO is performed at the OS level. There are multiple mechanisms across different OSes, but they can be broadly categorised into following either a readiness or completion model.
+
+The obvious starting place for the async IO traits is to simply add `async` to each method which performs IO. E.g., `fn read(&mut self, buf: &mut [u8]) -> Result<usize>` becomes `async fn read(&mut self, buf: &mut [u8]) -> Result<usize>`. This is very easy for the user because it abstracts all the details of when the task waits for the OS and how the OS communicates status of the operation to the IO library. However, this abstraction has some costs...
 
 ### Readiness
 
+Readiness-model IO is currently the most well-supported in async Rust. It is the model used by epoll (Linux) among others.
+
+From the perspective of the IO library, readiness IO has the following steps (I use read as an example, other operations are similar):
+
+* The library initiates the read.
+* The OS immediately returns and the library can schedule other work.
+* Later, the OS notifies the library that the read is ready.
+* The library passes a buffer to the OS to read into. The OS reads into the buffer and returns the bytes read, or returns an error. This step will never block.
+* The library may need to retry if the read failed, in particular if the OS gave an `EWOULDBLOCK` error indicating that no data was ready to read (i.e., the ready notification was a false positive).
+
+A strong advantage of this model is that the OS does not keep a buffer while waiting for IO to complete. That means a buffer can be allocated just in time to be used, or can be shared by multiple tasks (or the user can use many other memory handling strategies). This is important in the implementation of network servers where there may be many concurrent connections, the wait for IO can be long (since the wait is for a remote client), and the buffer must be fairly large since the size of the read is not known in advance.
+
+To implement readiness IO using the naive async read method described above, `read` takes the buffer reference. The IO library initiates the read with the OS and then waits to be scheduled; it must hold the buffer reference during this time. When the OS is ready, the library passes the buffer reference to the OS to read into and will retry if necessary. Finally it returns to the caller of `read`. This makes for an attractively simple API - the user does not need to be concerned with readiness notifications or retries, etc., however, there is no opportunity for the user to pass in the buffer just in time. I.e., it must be pre-allocated, which loses the primary advantage of the readiness model.
+
 ### Completion
+
+Completion-model IO is less well supported in the async Rust ecosystem, though the rise of io_uring is changing that (e.g., [Glommio](https://github.com/DataDog/glommio) and [Tokio-uring](https://github.com/tokio-rs/tokio-uring)). It is the model used by IOCP (Windows) and io_uring (Linux).
+
+From the perspective of the IO library, completion IO has the following steps (again, I use read as an example):
+
+* The library initiates the read and passes a buffer to read into.
+* The OS returns and the library can schedule other work.
+* Later, the OS reads directly into the buffer. When reading is complete (or if there is an error), it notifies the user process.
+
+In terms of sequencing, this is much closer to the naive read method given above. The advantage of this model is that the OS can read directly into the user's buffer without using an intermediate, internal buffer. Furthermore, the user can pass a reference into a target data structure. So, the IO can be zero copy: data is read directly from a device into its final destination.
+
+Unfortunately, there is a problem mapping completion to the naive Rust method too: cancellation. If the user wants to cancel the read, then it can send a cancellation message to the OS. This message is also async, it returns immediately but completes some time later when the OS will notify the user process that the IO was cancelled (or that there was an error). It is possible that an IO completes before the cancellation is processed.
+
+Now consider the lifetime of the buffer. The user process passes a reference to a buffer to the OS. The user process must keep the buffer alive (and must ensure nothing is written to the buffer) until the OS is done with it, i.e., either the IO completes or the IO is cancelled and the cancellation completes. Note that even if the IO is cancelled the buffer must be kept alive until either the IO or cancellation completes, it cannot be destroyed immediately.
+
+This is problematic in the Rust async model. In Rust, a future can be cancelled at any time (cancellation is not blockable on progress of any underlying operation). When a future is cancelled, the buffer passed to the IO library in `read` may be destroyed. If the buffer has been passed to the OS, that violates the required guarantee that the buffer is preserved until the IO completes. Even if the IO is cancelled, the cancellation completes from Rust's perspective before it completes from the OS's perspective. I.e., cancellation is unsound.
+
+Solutions will be explored below, but it is worth considering a common solution in use today which is that the buffer passed to `read` is only passed to the IO library and the IO library passes a separate buffer (which it manages) to the OS. However, this loses the zero-copy advantage of completion IO because the IO library must copy data from its buffer to the user's.
 
 
 ## Read and Write proposal

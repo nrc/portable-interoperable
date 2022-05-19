@@ -76,7 +76,8 @@ Now consider the lifetime of the buffer. The user process passes a reference to 
 
 This is problematic in the Rust async model. In Rust, a future can be cancelled at any time (cancellation is not blockable on progress of any underlying operation). When a future is cancelled, the buffer passed to the IO library in `read` may be destroyed. If the buffer has been passed to the OS, that violates the required guarantee that the buffer is preserved until the IO completes. Even if the IO is cancelled, the cancellation completes from Rust's perspective before it completes from the OS's perspective. I.e., cancellation is unsound.
 
-Solutions will be explored below, but it is worth considering a common solution in use today which is that the buffer passed to `read` is only passed to the IO library and the IO library passes a separate buffer (which it manages) to the OS. However, this loses the zero-copy advantage of completion IO because the IO library must copy data from its buffer to the user's.
+Solutions will be explored below, but if we must fit the naive `read` signature, then any solution must require the library to own buffers used for IO and then to copy the contents of its buffer into the one provided by the user. Obviously, this loses the zero-copy advantage of completion IO.
+
 
 
 ## Read and Write proposal
@@ -253,34 +254,6 @@ There is a bit of a foot-gun here because reference implementations make it poss
 
 The readiness mechanism using the `Ready` trait is extensible to other readiness notifications in the future. However, this is somewhat complicated since these notifications are nearly all platform-specific. (HUP is not, but requires special handling).
 
-### Requirements discussion
-
-#### Ergonomics
-
-For many users, this proposal will be optimally ergonomic to use. Implementing the IO traits is not ideally ergonomic, but that affects fewer users (and users who tend to be more sophisticated) and is not too bad - there are not too many methods to implement, and those methods have an easily understood purpose which should map well to the OS API. Likewise, for those users who need optimal control or performance, the ergonomics are not great, but such users must expect to be exposed to some details. We can also offer some good helpers to make implementation easier.
-
-I think there is an intrinsic trade-off between wanting to be close to the sync versions for ergonomics and wanting to be close to the underlying IO model for performance and control. I think this proposal is a good compromise point on that trade-off.
-
-#### Vectored reads and writes, and reading into uninitialized memory
-
-These goals are satisfied by the presence of the respective methods and in the same way as for the sync equivalent traits in std.
-
-#### Concurrent reading and writing of a single resource
-
-This works in both API paths (in most cases). In the memory-optimal path because `Ready::ready` can wait on readiness for both reading and writing at the same time. In the ergonomic path, for most resources at least, due to implementations of `Read` and `Write` on reference types.
-
-#### Work well as trait objects
-
-Assuming we get async functions in trait objects working well, the proposed traits work optimally as trait objects. With current plans, that will require some boxing, but that should only be one allocation per read, and only necessary if using trait objects.
-
-#### Work well with completion based systems
-
-Async IO systems which are completion-based, such as IOCP and io_uring will work with this proposal, but will not perform optimally. In particular, the implementation must copy a buffer on every read or write. The optimal way to use completion-based IO is to use the async version of the `BufRead` trait (see below).
-
-The high-level view here is that using `Read`/`Write` will work for any platform, but that for optimal performance the user must choose the buffered or unbuffered traits depending on the platform, not just the constraints of the application. That seems acceptable since for optimal performance, one must always take account of the characteristics of the underlying platform. However, it means the libraries which want to offer excellent performance on all platforms cannot treat buffering as orthogonal and must provide versions of their API using both `Read` and `BufRead` (respectively for `Write`) traits.
-
-
-TODO reorganise; other requirements
 
 ### Alternatives
 
@@ -349,6 +322,53 @@ This lets implementers choose if they want to support the memory-optimal path or
 It might be possible to reduce the set of IO traits to only the buffered varieties by using a sophisticated buffer or buffer manager type to abstract over the various ways in which buffers can be managed and passed to read methods. By having the buffer manager supply the buffer, there is no need to wait on readiness and instead the buffer manager creates or provides the buffer when the reader is ready.
 
 The approach would work well with completion based IO as well as readiness. However, this approach adds some complexity for the simple cases of read, would be a radical departure from the existing sync traits, and it's unclear if the lifetimes can be made to work in all cases.
+
+
+### Requirements discussion
+
+#### The traits should be ergonomic to implement and to use
+
+The ergonomic usage of the primary proposal and the simple async traits alternative are the most straightforward to use and equally ergonomic. The split trait and polling alternatives are more complex and less ergonomic. Implementing the IO traits in the primary proposal is more complex than in the simple async traits alternative, but that affects fewer users (and users who tend to be more sophisticated) and is not too bad - there are not too many methods to implement, and those methods have an easily understood purpose which should map well to the OS API.
+
+In terms of symmetry, the simple async traits alternative is optimal. The primary proposal is good for users who use the ergonomic path, and less good for implementers. The traits are a strict superset of their sync equivalents.
+
+I believe that putting the vectored methods and methods for reading into uninit memory makes things simpler and thus more ergonomic, however, it makes the traits less symmetric with the sync versions.
+
+All the other tweaks or minor alternatives make the primary proposal more complex or less symmetric.
+
+#### The traits support the same variations as the sync traits
+
+All alternatives support vectored reads and writes and reading into uninitialized memory, in a similar way to the sync traits. There is nothing specific to any alternative which makes this better or worse.
+
+#### Generic usage
+
+The primary proposal supports concurrent reading and writing by implementing `Read` and `Write` for reference types in the same manner as for the sync traits, or by using the explicit ready loop. There is a tweak which removes the first method, concurrent reads and writes would still be possible via the second method, but less ergonomically.
+
+Other alternatives support concurrent reads and writes similarly, or by polling or using a 'split' trait.
+
+Sometimes it is necessary to permit concurrent reads and writes in generic code. In this case, the reference impls solution does not work: it requires `T: Read + Write` and we can't easily require reference impls for concurrent reads and writes. The primary proposal would work in this case via the explicit ready loop. The `Split` trait also works here, using `T: Split` rather than `T: Read + Write`.
+
+The traits are usable as trait objects in all variations, assuming that we can support async trait objects in the language.
+
+#### The traits must work performantly with both readiness- (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
+
+For readiness-based systems, only the primary proposal (and its variations) do not require access to buffers until IO is ready.
+
+For completion-based systems, none of the proposals or alternatives work optimally. They all require copying the buffer into the buffer provided by the user.
+
+I believe that to optimally use compeltion-based IO, we must use alternative traits, such as `BufRead`, these are discussed below.
+
+The high-level view here is that using `Read`/`Write` will work for any platform, but that for optimal performance the user must choose the buffered or unbuffered traits depending on the platform, not just the constraints of the application. That seems acceptable since for optimal performance, one must always take account of the characteristics of the underlying platform. However, it means the libraries which want to offer excellent performance on all platforms cannot treat buffering as orthogonal and must provide versions of their API using both `Read` and `BufRead` (respectively for `Write`) traits.
+
+#### The traits should permit maximum flexibility of buffers
+
+All proposals, except for only having a `BufRead` trait, take a borrowed slice as a buffer. This is optimally flexible in most cases. All proposals support the vectored and uninintialised buffers also supported by sync `Read`, so here too we are optimally flexible (we may of course need to add support in the future for other buffers, but there are no known cases at the moment).
+
+#### The traits should work in no_std scenarios
+
+The major blocker here is that the `io::Error` type relies on the `Error` trait. There is work underway to move the `Error` trait out of std, at which point the IO traits can follow.
+
+None of the alternatives present any further difficulty in working with no_std crates.
 
 
 ## `BufRead` proposal

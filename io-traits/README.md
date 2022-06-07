@@ -407,29 +407,22 @@ Design with new trait:
 
 ```rust
 trait OwnedRead {
-    async fn read<T: OwnedReadBuf>(&mut self, buffer: impl T) -> Result<T>;
+    async fn read<T: OwnedBuf>(&mut self, buffer: T) -> Result<T>;
 }
 
-trait OwnedReadBuf {
-    fn as_mut_slice(&mut self) -> *mut [u8];
-    unsafe fn assume_init(&mut self, size: usize);
+trait OwnedBuf {
+    // ...
 }
 
 // An implementation using the initialised part of a Vector.
-impl OwnedReadBuf for Vec<u8> {
-    fn as_mut_slice(&mut self) -> *mut [u8] {
-        &mut **self
-    }
-
-    unsafe fn assume_init(&mut self, size: usize) {
-        self.truncate(size);
-    }
+impl OwnedBuf for Vec<u8> {
+    // ...
 }
 ```
 
-The alternative is to add `read` as `owned_read` or `moving_read` or similar to `async::Read`.
+For a possible (WIP) design of `OwnedBuf`, see [nrc/read-buf/../owned.rs](https://github.com/nrc/read-buf/blob/main/src/owned.rs).
 
-TODO, we've used `u8` here, but we should probably handle uninitialised data similarly to `ReadBuf`.
+The alternative is to add `read` as `owned_read` or `moving_read` or similar to `async::Read`.
 
 ### Alternative: an abstract owning pointer type
 

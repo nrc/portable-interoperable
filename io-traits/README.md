@@ -160,7 +160,7 @@ impl Debug for Readiness { ... }
 
 /// Whether an IO operation is ready for reading/writing or would block.
 #[derive(Copy, Clone, Debug, ...)]
-enum NonBlocking<T> {
+pub enum NonBlocking<T> {
     Ready(T),
     WouldBlock,
 }
@@ -230,8 +230,6 @@ async fn read_stream(stream: &TcpStream) -> Result<()> {
 
         return Ok(());
     }
-
-    Ok(())
 }
 ```
 

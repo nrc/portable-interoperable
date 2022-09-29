@@ -73,57 +73,482 @@ Solutions will be explored below, but if we must fit the naive `read` signature,
 
 ## `Read` proposal
 
-TODO
+This proposal consists of straightforward async `Read` (and `Write`) traits which closely follow their non-async counterparts. We also have sub-traits which are specialized for readiness and completion IO: `ReadinessRead` and `OwnedRead`. There are 'downcasting' methods on `Read` to facilitate converting to these traits where possible. I expect that we would stabilise the `Read` trait well in advance of the specialized traits.
+
+The `Read` trait (compare to non-async [`Read`](https://doc.rust-lang.org/nightly/std/io/trait.Read.html)):
+
+```rust
+pub trait Read {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    async fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize> { ... }
+    async fn read_buf(&mut self, buf: &mut BorrowedCursor<'_>) -> Result<()> { ... }
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> { ... }
+    async fn read_buf_exact(&mut self, buf: &mut BorrowedCursor<'_>) -> Result<()> { ... }
+    async fn read_buf_vectored(&mut self, bufs: &mut BorrowedSliceCursor<'_>) -> Result<usize> { ... }
+    async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> { ... }
+    async fn read_to_string(&mut self, buf: &mut String) -> Result<usize> { ... }
+
+    fn is_read_vectored(&self) -> bool { false }
+
+    fn by_ref(&mut self) -> &mut Self
+    where
+        Self: Sized,
+    { ... }
+
+    fn bytes(self) -> Bytes<Self>
+    where
+        Self: Sized,
+    { ... }
+
+    fn chain<R: Read>(self, next: R) -> Chain<Self, R>
+    where
+        Self: Sized,
+    { ... }
+
+    fn take(self, limit: u64) -> Take<Self>
+    where
+        Self: Sized,
+    { ... }
+
+    fn as_ready(&mut self) -> Option<&mut impl ReadyRead> {
+        None
+    }
+
+    fn as_owned(&mut self) -> Option<&mut impl OwnedRead> {
+        None
+    }
+
+    fn as_ready_dyn(&mut self) -> Option<&mut dyn ReadyRead> {
+        None
+    }
+
+    fn as_owned_dyn(&mut self) -> Option<&mut dyn OwnedRead> {
+        None
+    }
+}
+```
+
+Notes:
+
+* I have included `read_buf_vectored` based on an [open proposal](https://github.com/rust-lang/libs-team/issues/104).
+* `bytes`, `chain`, and `take` are not async methods but return types which implement `AsyncIterator` (c.f., `Iterator` in non-async `Read`).
+* The `as_*` methods are for downcasting. I have included both RPITIT and trait object versions, I'm not 100% sure that is necessary. These are the only methods without equivalents in non-async `Read`.
+
+The expectation is that nearly all code will use the `Read` trait only. Libraries which provide types which implement `Read`, should also provide implementations for `OwnedRead` and/or `ReadyRead` where possible. Users of these traits which support such methods can try downcasting before falling back to using plain `Read::read`. Adapter types (those which have an inner type which is a generic type bounded by `Read` and implement `Read` themselves) should implement `OwnedRead` and `ReadyRead` where their inner type does. Their implementation of `Read::read` should attempt to downcast and use the specialized implementations where possible.
+
+## Readiness read
+
+This trait is specialized for readiness IO systems such as epoll.
+
+```rust
+pub trait Ready {
+    // async
+    fn ready(&mut self, interest: Interest) -> Result<Readiness>;
+}
+
+pub trait ReadyRead: Ready + Read {
+    fn non_blocking_read(&mut self, buf: &mut BorrowedCursor<'_>) -> Result<NonBlocking<()>>;
+    fn non_blocking_read_vectored(&mut self, bufs: &mut BorrowedSliceCursor<'_>) -> Result<NonBlocking<usize>> { ... }
+}
+
+/// Express which notifications the user is interested in receiving.
+#[derive(Copy, Clone)]
+pub struct Interest(u32);
+
+/// Describes which operations are ready for an IO resource.
+#[derive(Copy, Clone)]
+pub struct Readiness(u32);
+
+/// Whether an IO operation is ready for reading/writing or would block.
+#[derive(Copy, Clone, Debug)]
+pub enum NonBlocking<T> {
+    Ready(T),
+    WouldBlock,
+}
+```
+
+Notes:
+
+* This approach requires a different idiom for reading, see below. That pattern facilitates avoiding memory allocation before data is ready to read.
+* I'm unclear if we should have convenience async methods including `read`, `read_vectored`, `read_exact`, or `read_to_end`. My thinking for not doing so is that if you want the performance benefits of `ReadyRead` then you probably also want the performance benefits of reading into uninitialized memory (or at least, the ergonomic hit of using `BorrowedCursor` rather than `&mut [u8]` is easy enough to ignore when that is not true). If the default impls of the corresponding methods in `Read` include the downcasting checks, then I think you get all of the benefit of having these methods here.
 
 ## Owned read
 
-An extension we should consider is permitting reads into owned (rather than borrowed) buffers. We could add either an `OwnedRead` trait or an `owned_read` function to `async::Read`. We would want to do this as well as supporting `async::BufRead`, since the former supports explicitly internal buffers. Owned read is useful for completion-based systems where the user manages the buffers rather than the library or resource. (We can't use borrowed slices due to cancellation).
-
-Design with new trait:
+`OwnedRead` is a specialized trait useful for completion IO systems, e.g., io_uring or IOCP. It circumvents the cancellation problem by letting the IO library own the buffer for the duration of the read.
 
 ```rust
-trait OwnedRead {
-    async fn read<T: OwnedBuf>(&mut self, buffer: T) -> Result<T>;
-}
-
-trait OwnedBuf {
-    // ...
-}
-
-// An implementation using the initialised part of a Vector.
-impl OwnedBuf for Vec<u8> {
-    // ...
+pub trait OwnedRead: Read {
+    async fn read(&mut self, buf: OwnedBuf) -> (OwnedBuf, Result<()>);
+    async fn read_exact(&mut self, buf: OwnedBuf) -> (OwnedBuf, Result<()>) { ... }
+    async fn read_to_end(&mut self, buf: Vec<u8>) -> (Vec<u8>, Result<usize>) { ... }
 }
 ```
 
-For a possible (WIP) design of `OwnedBuf`, see [nrc/read-buf/../owned.rs](https://github.com/nrc/read-buf/blob/main/src/owned.rs).
+Notes:
 
-TODO OwnedWrite
+* Vectored reads are left as future work.
+* OwnedBuf permits reads into uninitialized memory, so there is no need for `read_buf` methods.
+* We must return the buffer since it is moved into the read methods.
+* `read_to_end` takes a `Vec` since it must extend the buffer and `OwnedBuf` is intentionally not extensible.
+* FIXME (open question): the methods take an OwnedBuf with the default allocator. If we permit any allocator then we require a generic method and `OwnedRead` cannot be used as a trait object. I'm not sure what is the right solution here.
 
-The alternative is to add `read` as `owned_read` or `moving_read` or similar to `async::Read`.
-
-In either case, we may want to add non-async versions, both for symmetry with async, and because the concept might be generally useful (question: are there non-async use cases?).
-
-### Alternative: an abstract owning pointer type
-
-If the language had an abstract owning pointer type, we could use that rather than the `OwnedReadBuf` trait (using a strawman `~` syntax):
+`OwnedBuf` is a new type similar in API to [`BorrowedBuf`](https://doc.rust-lang.org/nightly/std/io/struct.BorrowedBuf.html), but which owns its data. Since the buffer must be owned by the IO library during the read, it is passed as a buf rather than a cursor; the cursor is still used for writing. We use a concrete type rather than a trait to avoid generic methods or trait objects in `OwnedRead`. The idea is that any contiguous, owned buffer can be represented as an `OwnedBuf` and can be converted to or from the original type. There is provided support for easily converting to and from `Vec<u8>` and `Vec<MaybeUninit<u8>>`.
 
 ```rust
-trait OwnedRead {
-    async fn read(&mut self, buffer: ~[u8]) -> Result<~[u8]>;
+pub struct OwnedBuf<A: 'static + Allocator = Global> {
+    data: *mut MaybeUninit<u8>,
+    dtor: &'static dyn Fn(&mut OwnedBuf<A>),
+    capacity: usize,
+    /// The length of `self.buf` which is known to be filled.
+    filled: usize,
+    /// The length of `self.buf` which is known to be initialized.
+    init: usize,
+    allocator: A,
+}
+
+impl<A: 'static + Allocator> OwnedBuf<A> {
+    #[inline]
+    pub fn new(data: *mut MaybeUninit<u8>, dtor: &'static dyn Fn(&mut OwnedBuf), capacity: usize, filled: usize, init: usize) -> OwnedBuf<Global> {
+        OwnedBuf::new_in(data, dtor, capacity, filled, init, Global)
+    }
+
+    #[inline]
+    pub fn new_in(data: *mut MaybeUninit<u8>, dtor: &'static dyn Fn(&mut OwnedBuf<A>), capacity: usize, filled: usize, init: usize, allocator: A) -> OwnedBuf<A> {
+        OwnedBuf {
+            data,
+            dtor,
+            capacity,
+            filled,
+            init,
+            allocator,
+        }
+    }
+
+    /// SAFETY: only safe if self was created from a Vec<u8, A> or Vec<MaybeUninit<u8>, A>.
+    #[inline]
+    pub unsafe fn into_vec(self) -> Vec<u8, A> {
+        let this = ManuallyDrop::new(self);
+        Vec::from_raw_parts_in(this.data as *mut u8, this.filled, this.capacity, unsafe { ptr::read(&this.allocator) })
+    }
+
+    /// SAFETY: only safe if self was created from a Vec<u8, A> or Vec<MaybeUninit<u8>, A>.
+    #[inline]
+    pub unsafe fn into_uninit_vec(self) -> Vec<MaybeUninit<u8>, A> {
+        let this = ManuallyDrop::new(self);
+        Vec::from_raw_parts_in(this.data, this.filled, this.capacity, unsafe { ptr::read(&this.allocator) })
+    }
+
+    /// Returns the length of the initialized part of the buffer.
+    #[inline]
+    pub fn init_len(&self) -> usize {
+        self.init
+    }
+
+    /// Returns a shared reference to the filled portion of the buffer.
+    #[inline]
+    pub fn filled(&self) -> &[u8] {
+        // SAFETY: We only slice the filled part of the buffer, which is always valid
+        unsafe { MaybeUninit::slice_assume_init_ref(slice::from_raw_parts(self.data, self.filled)) }
+    }
+
+    /// Returns a cursor over the unfilled part of the buffer.
+    #[inline]
+    pub fn unfilled(&mut self) -> OwnedCursor<'_, A> {
+        OwnedCursor {
+            start: self.filled,
+            buf: self,
+        }
+    }
+
+    /// Clears the buffer, resetting the filled region to empty.
+    ///
+    /// The number of initialized bytes is not changed, and the contents of the buffer are not modified.
+    #[inline]
+    pub fn clear(&mut self) -> &mut Self {
+        self.filled = 0;
+        self
+    }
+
+    /// Asserts that the first `n` bytes of the buffer are initialized.
+    ///
+    /// `OwnedBuf` assumes that bytes are never de-initialized, so this method does nothing when called with fewer
+    /// bytes than are already known to be initialized.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the first `n` unfilled bytes of the buffer have already been initialized.
+    #[inline]
+    pub unsafe fn set_init(&mut self, n: usize) -> &mut Self {
+        self.init = max(self.init, n);
+        self
+    }
+}
+
+impl<A: 'static + Allocator> Drop for OwnedBuf<A> {
+    fn drop(&mut self) {
+        (self.dtor)(self)
+    }
+}
+
+pub struct OwnedCursor<'buf, A: 'static + Allocator> {
+    buf: &'buf mut OwnedBuf<A>,
+    start: usize,
+}
+
+impl<'a, A: 'static + Allocator> OwnedCursor<'a, A> {
+    /// Reborrow this cursor by cloning it with a smaller lifetime.
+    ///
+    /// Since a cursor maintains unique access to its underlying buffer, the borrowed cursor is
+    /// not accessible while the new cursor exists.
+    #[inline]
+    pub fn reborrow<'this>(&'this mut self) -> OwnedCursor<'this, A> {
+        OwnedCursor {
+            buf: self.buf,
+            start: self.start,
+        }
+    }
+
+    /// Returns the available space in the cursor.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity - self.buf.filled
+    }
+
+    /// Returns the number of bytes written to this cursor since it was created from a `BorrowedBuf`.
+    ///
+    /// Note that if this cursor is a reborrowed clone of another, then the count returned is the
+    /// count written via either cursor, not the count since the cursor was reborrowed.
+    #[inline]
+    pub fn written(&self) -> usize {
+        self.buf.filled - self.start
+    }
+
+    /// Returns a shared reference to the initialized portion of the cursor.
+    #[inline]
+    pub fn init_ref(&self) -> &[u8] {
+        let filled = self.buf.filled;
+        // SAFETY: We only slice the initialized part of the buffer, which is always valid
+        unsafe { MaybeUninit::slice_assume_init_ref(&slice::from_raw_parts(self.buf.data, self.buf.init)[filled..]) }
+    }
+
+    /// Returns a mutable reference to the initialized portion of the cursor.
+    #[inline]
+    pub fn init_mut(&mut self) -> &mut [u8] {
+        let filled = self.buf.filled;
+        let init = self.buf.init;
+        // SAFETY: We only slice the initialized part of the buffer, which is always valid
+        unsafe {
+            MaybeUninit::slice_assume_init_mut(&mut self.buf_as_slice()[filled..init])
+        }
+    }
+
+    /// Returns a mutable reference to the uninitialized part of the cursor.
+    ///
+    /// It is safe to uninitialize any of these bytes.
+    #[inline]
+    pub fn uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        let init = self.buf.init;
+        unsafe { &mut self.buf_as_slice()[init..] }
+    }
+
+    /// Returns a mutable reference to the whole cursor.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not uninitialize any bytes in the initialized portion of the cursor.
+    #[inline]
+    pub unsafe fn as_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        let filled = self.buf.filled;
+        &mut self.buf_as_slice()[filled..]
+    }
+
+    #[inline]
+    unsafe fn buf_as_slice(&mut self) -> &mut [MaybeUninit<u8>] {
+        slice::from_raw_parts_mut(self.buf.data, self.buf.capacity)
+    }
+
+    /// Advance the cursor by asserting that `n` bytes have been filled.
+    ///
+    /// After advancing, the `n` bytes are no longer accessible via the cursor and can only be
+    /// accessed via the underlying buffer. I.e., the buffer's filled portion grows by `n` elements
+    /// and its unfilled portion (and the capacity of this cursor) shrinks by `n` elements.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the first `n` bytes of the cursor have been properly
+    /// initialised.
+    #[inline]
+    pub unsafe fn advance(&mut self, n: usize) -> &mut Self {
+        self.buf.filled += n;
+        self.buf.init = max(self.buf.init, self.buf.filled);
+        self
+    }
+
+    /// Initializes all bytes in the cursor.
+    #[inline]
+    pub fn ensure_init(&mut self) -> &mut Self {
+        for byte in self.uninit_mut() {
+            byte.write(0);
+        }
+        self.buf.init = self.buf.capacity;
+
+        self
+    }
+
+    /// Asserts that the first `n` unfilled bytes of the cursor are initialized.
+    ///
+    /// `BorrowedBuf` assumes that bytes are never de-initialized, so this method does nothing when
+    /// called with fewer bytes than are already known to be initialized.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the first `n` bytes of the buffer have already been initialized.
+    #[inline]
+    pub unsafe fn set_init(&mut self, n: usize) -> &mut Self {
+        self.buf.init = max(self.buf.init, self.buf.filled + n);
+        self
+    }
+
+    /// Appends data to the cursor, advancing position within its buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.capacity()` is less than `buf.len()`.
+    #[inline]
+    pub fn append(&mut self, buf: &[u8]) {
+        assert!(self.capacity() >= buf.len());
+
+        // SAFETY: we do not de-initialize any of the elements of the slice
+        unsafe {
+            MaybeUninit::write_slice(&mut self.as_mut()[..buf.len()], buf);
+        }
+
+        // SAFETY: We just added the entire contents of buf to the filled section.
+        unsafe {
+            self.set_init(buf.len());
+        }
+        self.buf.filled += buf.len();
+    }
+}
+
+impl<'a, A: 'static + Allocator> Write for OwnedCursor<'a, A> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.append(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn drop_vec<A: 'static + Allocator>(buf: &mut OwnedBuf<A>) {
+    let buf = ManuallyDrop::new(buf);
+    let _vec = unsafe { Vec::from_raw_parts_in(buf.data, buf.filled, buf.capacity, ptr::read(&buf.allocator)) };
+}
+
+impl<A: 'static + Allocator> From<Vec<MaybeUninit<u8>, A>> for OwnedBuf<A> {
+    fn from(v: Vec<MaybeUninit<u8>, A>) -> OwnedBuf<A> {
+        let (data, len, capacity, allocator) = v.into_raw_parts_with_alloc();
+        OwnedBuf {
+            data,
+            dtor: &drop_vec,
+            capacity,
+            filled: len,
+            init: len,
+            allocator,
+        }
+    }
+}
+
+impl<A: 'static + Allocator> From<Vec<u8, A>> for OwnedBuf<A> {
+    fn from(v: Vec<u8, A>) -> OwnedBuf<A> {
+        let (data, len, capacity, allocator) = v.into_raw_parts_with_alloc();
+        OwnedBuf {
+            data: data as *mut MaybeUninit<u8>,
+            dtor: &drop_vec,
+            capacity,
+            filled: len,
+            init: len,
+            allocator,
+        }
+    }
 }
 ```
 
-In the same way that `&` lets us abstract any borrowing pointer type, `~` would let us abstract any owning pointer type. `~T` is a pointer to a value of `T` with move semantics and which on destruction calls the destructor for the underlying value and the pointer. Any owning pointer (e.g., `Box<T>`, `Arc<T>`, etc.) can be converted into a `~T`. A `~T` can be downcast into any concrete owning pointer with a runtime check. Similarly, an owning collection can be converted into an owned slice, e.g., `Vec<T>` to `~[T]`. An owning slice can be shrunk like a borrowed slice. We would probably need some mechanism to restore an owned slice. E.g., if a `Vec<T>` is converted to a `~[T]` and then shrunk, we would need some way to restore the original `Vec`.
+## Usage
 
-This idea is somewhat similar to some ideas around `dyn*` pointers. It is different to previous `&move` proposals in that `&move` does not call the destructor of the underlying storage on its destruction and thus must be constrained by the lifetime of the storage.
+A simple read looks like:
 
-The advantage of this approach is that it works better with trait objects since there is no generic parameter in the `read` method. The disadvantage is that it requires a significant language change.
+```rust
+async fn read_example(reader: &mut impl Read) -> Result<()> {
+    let mut buf = [0; 1024];
+    reader.read(&mut buf).await?;
+    // Use buf
+    Ok(())
+}
+```
+
+The specialized traits can be used by themselves:
+
+```rust
+async fn read_example_owned(reader: &mut impl OwnedRead) -> Result<()> {
+    let mut buf = vec![0; 1024];
+    let result = reader.read(buf).await;
+    buf = result.0;
+    result.1?;
+    // Use buf
+    Ok(())
+}
+
+async fn read_example_ready(reader: &mut impl ReadyRead) -> Result<()> {
+    loop {
+        reader.ready(Interest::READABLE).await?;
+
+        let mut buf = [0; 1024];
+        if let NonBlocking::Ready(n) = reader.non_blocking_read(buf)? {
+            // Use buf
+            return Ok(());
+        }
+    }
+}
+```
+
+Where a user of read wants optimal performance and cannot know if the reader implements a specialized trait, then it can test by downcasting. I demonstrate testing for both traits; most end user code would only test for the trait that maximizes their performance. Wrapper traits and the provided methods on `Read` should test for both.
+
+```rust
+async fn read_example(reader: &mut impl Read) -> Result<()> {
+    if let Some(reader) = reader.as_owned() {
+        let mut buf = vec![0; 1024];
+        let result = reader.read(buf).await;
+        buf = result.0;
+        result.1?;
+        // Use buf
+    } else if let Some(reader) = reader.as_ready() {
+        loop {
+            reader.ready(Interest::READABLE).await?;
+
+            let mut buf = [0; 1024];
+            if let NonBlocking::Ready(n) = reader.non_blocking_read(buf)? {
+                // Use buf
+                return Ok(());
+            }
+        }
+    } else {
+        let mut buf = [0; 1024];
+        reader.read(&mut buf).await?;
+        // Use buf
+    }
+    Ok(())
+}
+```
 
 
 ## `Write` proposal
 
 TODO
+
+TODO OwnedWrite
 
 ## `BufRead` proposal
 
@@ -178,7 +603,7 @@ There was some discussion about `Seek` in Tokio. One of the key sticking points 
 
 ## Alternatives
 
-There are several alternatives or tweaks possible to the design proposed above. The first few are presented in separate files and I consider them feasible (though inferior to the above proposal), the later few are clearly sub-optimal and I haven't described them in depth.
+There are several alternatives to the design proposed above. The first few are presented in separate files and I consider them feasible (though inferior to the above proposal), the later few are clearly sub-optimal and I haven't described them in depth.
 
 ### Readiness super trait
 
@@ -228,29 +653,15 @@ pub trait Read {
 
 Given how un-ergonomic this approach is, I don't think it is worth pursuing unless other approaches turn out to be dead ends. (We could add the async methods as provided methods to make this approach more ergonomic for users, however, it is still less ergonomic for implementers and there is no real benefit other than backwards compatibility).
 
-### Elide the `non_blocking_` methods
-
-In this alternative, we'd keep the `Ready` trait, but the `Read` and `Write` traits would only have the async methods, not the `non_blocking_` ones. In the common case, the async read would return immediately and the user would not need to handle 'would block' errors. However, since in some cases the user would need to wait for the method to return, one could not share a single buffer between all reads on a thread. Furthermore, these functions couldn't be called from polling functions, or other non-async contexts.
-
-An alternative alternative would be to use the synchronous version of the `Read::read`, rather than `async::Read::non_blocking_read`. That has the right async-ness, but would need to handle 'would block' errors differently, since we would lose asynchronous-ness if we blocked on the `read` call. I don't think that can be done at the moment. It's possible we could do that with some form of async overloading, if we could have sync, async, and non-blocking versions of the same method (though note that that is an extension to the usual proposal for async overloading).
-
-### `read_ready` and `write_ready` methods rather than a `Ready` trait
-
-This would lead to fewer traits and therefore a simpler API. However, there would be more methods overall (which would lead to code duplication for implementers). The mechanism would not be extensible to other readiness notifications, and it means that a single thread can't concurrently wait for both read and write readiness.
-
-### Make `Ready` optional, rather than a super-trait
-
-This lets implementers choose if they want to support the memory-optimal path or just the ergonomic path. However, it also means that in generic code there is no way to use the memory-optimal path unless it is explicitly declared (i.e., changing the implementation becomes a breaking change, or code is reliant on intermediate generic code to require the `Ready` bound as well as `Read` or `Write`).
-
 ### Offer only `BufRead`, and not `Read` (likewise for `Write`)
 
 It might be possible to reduce the set of IO traits to only the buffered varieties by using a sophisticated buffer or buffer manager type to abstract over the various ways in which buffers can be managed and passed to read methods. By having the buffer manager supply the buffer, there is no need to wait on readiness and instead the buffer manager creates or provides the buffer when the reader is ready.
 
 The approach would work well with completion based IO as well as readiness. However, this approach adds some complexity for the simple cases of read, would be a radical departure from the existing sync traits, and it's unclear if the lifetimes can be made to work in all cases.
 
-### Add non-async version of readiness support
+### Add non-async version of readiness and owned read support
 
-Although using the readiness API is more strongly motivated in async code, there is no reason it can't be used in non-async code. We might consider adding support for explicit readiness support to std. This would increase the symmetry between sync and async libraries at the expense of increasing the surface are of std.
+Although using the readiness and owned APIs is more strongly motivated in async code, there is no reason it can't be used in non-async code. We might consider adding support for explicit readiness support to std. This would increase the symmetry between sync and async libraries at the expense of increasing the surface are of std.
 
 ## Requirements discussion
 
@@ -259,44 +670,34 @@ TODO evalute BufRead/OwnedRead, evaluate against requirements (in particular zer
 
 ### The traits should be ergonomic to implement and to use
 
-The ergonomic usage of the primary proposal and the simple async traits alternative are the most straightforward to use and equally ergonomic. The split trait and polling alternatives are more complex and less ergonomic. Implementing the IO traits in the primary proposal is more complex than in the simple async traits alternative, but that affects fewer users (and users who tend to be more sophisticated) and is not too bad - there are not too many methods to implement, and those methods have an easily understood purpose which should map well to the OS API.
+On the plus side, the primary proposal is simple in the simple case (both to use and define) and is as close to symmetric with the non-async traits as possible (assuming we support specialized IO modes at all). It is always possible to use the specialized traits from the basic one, without requiring multiple versions of functions or data types. On the minus side, 'good citizen' libraries do have some extra work to do (mostly unavoidable if we are to support the specialized modes), in particular, optimally implementing a wrapper type requires some work and that work is not enforced or encouraged by the types (i.e., one can just write a naive `read` impl and there is no warning).
 
-In terms of symmetry, the simple async traits alternative is optimal. The primary proposal is good for users who use the ergonomic path, and less good for implementers. The traits are a strict superset of their sync equivalents.
-
-I believe that putting the vectored methods and methods for reading into uninit memory makes things simpler and thus more ergonomic, however, it makes the traits less symmetric with the sync versions.
-
-All the other tweaks or minor alternatives make the primary proposal more complex or less symmetric.
+The split trait and polling alternatives are more complex and less ergonomic. Implementing the IO traits in the primary proposal is more complex than in the simple async traits alternative, but that does not support optimal performance. All the other tweaks or minor alternatives make the primary proposal more complex or less symmetric.
 
 ### The traits support the same variations as the sync traits
 
 All alternatives support vectored reads and writes and reading into uninitialized memory, in a similar way to the sync traits. There is nothing specific to any alternative which makes this better or worse.
 
+We could remove support for `&mut [u8]` reads and only support `BorrowedBuf` reads. This would be a simpler API and just as flexible, at the cost of a tiny reduction in ergonomics and a reduction in symmetry.
+
 ### Generic usage
 
-The primary proposal supports concurrent reading and writing by implementing `Read` and `Write` for reference types in the same manner as for the sync traits, or by using the explicit ready loop. There is a tweak which removes the first method, concurrent reads and writes would still be possible via the second method, but less ergonomically.
+The primary proposal supports concurrent reading and writing by implementing `Read` and `Write` for reference types in the same manner as for the sync traits.
 
 Other alternatives support concurrent reads and writes similarly, or by polling or using a 'split' trait.
 
-Sometimes it is necessary to permit concurrent reads and writes in generic code. In this case, the reference impls solution does not work: it requires `T: Read + Write` and we can't easily require reference impls for concurrent reads and writes. The primary proposal would work in this case via the explicit ready loop. The `Split` trait also works here, using `T: Split` rather than `T: Read + Write`.
+Sometimes it is necessary to permit concurrent reads and writes in generic code. In this case, the reference impls solution does not work: it requires `T: Read + Write` and we can't easily require reference impls for concurrent reads and writes. The primary proposal would work in this case via `ReadyRead`, but not in the simple or owned case (this is similar to the situation in non-async code). The `Split` trait also works here, using `T: Split` rather than `T: Read + Write`.
 
 The traits are usable as trait objects in all variations, assuming that we can support async trait objects in the language.
 
 ### The traits must work performantly with both readiness- (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
 
-For readiness-based systems, only the primary proposal (and its variations) do not require access to buffers until IO is ready.
-
-For completion-based systems, none of the proposals or alternatives work optimally. They all require copying the buffer into the buffer provided by the user.
-
-I believe that to optimally use compeltion-based IO, we must use alternative traits, such as `BufRead`, these are discussed below.
-
-The high-level view here is that using `Read`/`Write` will work for any platform, but that for optimal performance the user must choose the buffered or unbuffered traits depending on the platform, not just the constraints of the application. That seems acceptable since for optimal performance, one must always take account of the characteristics of the underlying platform. However, it means the libraries which want to offer excellent performance on all platforms cannot treat buffering as orthogonal and must provide versions of their API using both `Read` and `BufRead` (respectively for `Write`) traits.
+The primary proposal addresses this requirement well by providing the specialized traits. The only downside is that there is no guarantee (or static checking) of whether the more performant modes are available.
 
 ### The traits should permit maximum flexibility of buffers
 
-All proposals, except for only having a `BufRead` trait, take a borrowed slice as a buffer. This is optimally flexible in most cases. All proposals support the vectored and uninintialised buffers also supported by sync `Read`, so here too we are optimally flexible (we may of course need to add support in the future for other buffers, but there are no known cases at the moment).
+We do not provide a trait where the IO library manages the buffers (in some previous proposals I called this `ManagedRead`). One could use `BufRead` for this, though the API is optimised for tasks which can't be done without buffering, rather than generic reading. One could also implement such a trait in a third-party crate on top of `OwnedRead`. An alternative would be to include such a trait in std. This could be done later. I opted not to for the sake of simplicity.
 
 ### The traits should work in no_std scenarios
 
-The major blocker here is that the `io::Error` type relies on the `Error` trait. There is work underway to move the `Error` trait out of std, at which point the IO traits can follow.
-
-None of the alternatives present any further difficulty in working with no_std crates.
+Now that `std::Error` has moved to core, none of the alternatives present any further difficulty in working with no_std crates.

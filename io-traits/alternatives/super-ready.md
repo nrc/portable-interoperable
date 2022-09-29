@@ -175,3 +175,19 @@ Such implementations are not possible today in some runtimes due details of thei
 There is a bit of a foot-gun here because reference implementations make it possible to have multiple simultaneous readers or writers. However, that is somewhat difficult to do unintentionally, is already possible with the sync traits, and is possible even without the reference impls by cloning the underlying handles.
 
 The readiness mechanism using the `Ready` trait is extensible to other readiness notifications in the future. However, this is somewhat complicated since these notifications are nearly all platform-specific. (HUP is not, but requires special handling).
+
+## Tweaks
+
+### Elide the `non_blocking_` methods
+
+In this alternative, we'd keep the `Ready` trait, but the `Read` and `Write` traits would only have the async methods, not the `non_blocking_` ones. In the common case, the async read would return immediately and the user would not need to handle 'would block' errors. However, since in some cases the user would need to wait for the method to return, one could not share a single buffer between all reads on a thread. Furthermore, these functions couldn't be called from polling functions, or other non-async contexts.
+
+An alternative alternative would be to use the synchronous version of the `Read::read`, rather than `async::Read::non_blocking_read`. That has the right async-ness, but would need to handle 'would block' errors differently, since we would lose asynchronous-ness if we blocked on the `read` call. I don't think that can be done at the moment. It's possible we could do that with some form of async overloading, if we could have sync, async, and non-blocking versions of the same method (though note that that is an extension to the usual proposal for async overloading).
+
+### `read_ready` and `write_ready` methods rather than a `Ready` trait
+
+This would lead to fewer traits and therefore a simpler API. However, there would be more methods overall (which would lead to code duplication for implementers). The mechanism would not be extensible to other readiness notifications, and it means that a single thread can't concurrently wait for both read and write readiness.
+
+### Make `Ready` optional, rather than a super-trait
+
+This lets implementers choose if they want to support the memory-optimal path or just the ergonomic path. However, it also means that in generic code there is no way to use the memory-optimal path unless it is explicitly declared (i.e., changing the implementation becomes a breaking change, or code is reliant on intermediate generic code to require the `Ready` bound as well as `Read` or `Write`).

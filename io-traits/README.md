@@ -20,12 +20,12 @@ Not in priority order.
   - The traits must support reading into uninitialized memory
 * Generic usage
   - The traits must support concurrent reading and writing of a single resource
-  - The traits should work well as trait objects
+  - The traits should work well as trait objects (we're assuming the `dyn*` work will progress as expected)
 * The traits must work performantly with both readiness- (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
   - When working with completion-based systems, the traits should support zero-copy reads and writes (i.e., the OS can read data directly into the user's buffer)
   - When working with readiness-based systems, the traits should not require access to buffers until IO is ready
 * The traits should permit maximum flexibility of buffers
-  - buffers should not be constrained to a single concrete type.
+  - buffers should not be constrained to a single concrete type (i.e., users can use there own buffer types with the IO traits and are not constrained to using a single concrete type such as `Vec<u8>`).
   - We should support buffers that are allocated on the stack or owned by other data structures
 * The traits should work in no_std scenarios
 
@@ -134,7 +134,7 @@ Notes:
 * `bytes`, `chain`, and `take` are not async methods but return types which implement `AsyncIterator` (c.f., `Iterator` in non-async `Read`).
 * The `as_*` methods are for downcasting. I have included both RPITIT and trait object versions, I'm not 100% sure that is necessary. These are the only methods without equivalents in non-async `Read`.
 
-The expectation is that nearly all code will use the `Read` trait only. Libraries which provide types which implement `Read`, should also provide implementations for `OwnedRead` and/or `ReadyRead` where possible. Users of these traits which support such methods can try downcasting before falling back to using plain `Read::read`. Adapter types (those which have an inner type which is a generic type bounded by `Read` and implement `Read` themselves) should implement `OwnedRead` and `ReadyRead` where their inner type does. Their implementation of `Read::read` should attempt to downcast and use the specialized implementations where possible.
+The expectation is that nearly all code will use the `Read` trait only. Libraries which provide types which implement `Read`, should also provide implementations for `OwnedRead` and/or `ReadyRead` where possible. Users of these traits which support such methods can try downcasting before falling back to using plain `Read::read`. Adapter types (those which have an inner type which is a generic type bounded by `Read` and implement `Read` themselves) should implement `OwnedRead` and `ReadyRead` where their inner type does.
 
 ## Readiness read
 
@@ -165,12 +165,40 @@ pub enum NonBlocking<T> {
     Ready(T),
     WouldBlock,
 }
+
+impl Interest {
+    pub const READ = ...;
+    pub const WRITE = ...;
+    pub const READ_WRITE = Interest(Interest::Read.0 | Interest::Write.0);
+}
+
+impl Debug for Interest { ... }
+
+impl Readiness {
+    /// The resource is ready to read from.
+    pub fn read(self) -> bool { ... }
+
+    ///  The resource is ready to write to.
+    pub fn write(self) -> bool { ... }
+
+    /// The resource has hung up.
+    ///
+    /// Note there may still be data to read.
+    /// Note that the user does not *need* to check this method, even if the resource has hung up,
+    /// the behaviour of `non_blocking_read` and `non_blocking_write` is defined and they should not
+    /// panic.
+    /// Note that the user does not need to request an interest in hup notifications, they may always
+    /// be returned
+    pub fn hup(self) -> bool { ... }
+}
+
+impl Debug for Readiness { ... }
 ```
 
 Notes:
 
 * This approach requires a different idiom for reading, see below. That pattern facilitates avoiding memory allocation before data is ready to read.
-* I'm unclear if we should have convenience async methods including `read`, `read_vectored`, `read_exact`, or `read_to_end`. My thinking for not doing so is that if you want the performance benefits of `ReadyRead` then you probably also want the performance benefits of reading into uninitialized memory (or at least, the ergonomic hit of using `BorrowedCursor` rather than `&mut [u8]` is easy enough to ignore when that is not true). If the default impls of the corresponding methods in `Read` include the downcasting checks, then I think you get all of the benefit of having these methods here.
+* I'm unclear if we should have convenience async methods including `read`, `read_vectored`, `read_exact`, or `read_to_end`. My thinking for not doing so is that if you want the performance benefits of `ReadyRead` then you probably also want the performance benefits of reading into uninitialized memory (or at least, the ergonomic hit of using `BorrowedCursor` rather than `&mut [u8]` is easy enough to ignore when that is not true).
 
 ## Owned read
 
@@ -190,7 +218,7 @@ Notes:
 * OwnedBuf permits reads into uninitialized memory, so there is no need for `read_buf` methods.
 * We must return the buffer since it is moved into the read methods.
 * `read_to_end` takes a `Vec` since it must extend the buffer and `OwnedBuf` is intentionally not extensible.
-* FIXME (open question): the methods take an OwnedBuf with the default allocator. If we permit any allocator then we require a generic method and `OwnedRead` cannot be used as a trait object. I'm not sure what is the right solution here.
+* FIXME (open question): the methods take an OwnedBuf with the default allocator. If we permit any allocator then we require a generic method and `OwnedRead` cannot be used as a trait object. I'm not sure what is the right solution here. It's possible `dyn*` helps here, then we can take the allocator as a `dyn*` trait object (which for the common case of a zero or pointer-sized allocator, would not have to allocate).
 
 `OwnedBuf` is a new type similar in API to [`BorrowedBuf`](https://doc.rust-lang.org/nightly/std/io/struct.BorrowedBuf.html), but which owns its data. Since the buffer must be owned by the IO library during the read, it is passed as a buf rather than a cursor; the cursor is still used for writing. We use a concrete type rather than a trait to avoid generic methods or trait objects in `OwnedRead`. The idea is that any contiguous, owned buffer can be represented as an `OwnedBuf` and can be converted to or from the original type. There is provided support for easily converting to and from `Vec<u8>` and `Vec<MaybeUninit<u8>>`.
 
@@ -514,7 +542,7 @@ async fn read_example_ready(reader: &mut impl ReadyRead) -> Result<()> {
 }
 ```
 
-Where a user of read wants optimal performance and cannot know if the reader implements a specialized trait, then it can test by downcasting. I demonstrate testing for both traits; most end user code would only test for the trait that maximizes their performance. Wrapper traits and the provided methods on `Read` should test for both.
+Where a user of read wants optimal performance and cannot know if the reader implements a specialized trait, then it can test by downcasting. I demonstrate testing for both traits; most end user code would only test for the trait that maximizes their performance.
 
 ```rust
 async fn read_example(reader: &mut impl Read) -> Result<()> {
@@ -543,6 +571,7 @@ async fn read_example(reader: &mut impl Read) -> Result<()> {
 }
 ```
 
+Wrapper traits should implement all traits by dispatching to their inner traits (and doing whatever processing is necessary for the specifics of the trait). The `Read` implementation should not downcast.
 
 ## `Write` proposal
 

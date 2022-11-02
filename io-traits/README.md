@@ -598,13 +598,12 @@ pub trait BufRead: Read {
 * I've elided `split` and `lines` methods since these are async iterators and there are still open questions there. I assume we will add these later. Besides the questions about async iterators, I don't think there is anything too interesting about these methods.
 
 
-### ` BufReader`
+### `BufReader`
 
 `BufReader` is a concrete type, it's a utility type for converting objects which implement `Read` into objects which implement `BufRead`. I.e., it encapsulates a reader with a buffer to make a reader with an internal buffer. `BufReader` provides its own buffer and does not let the user customise it.
 
-I think that we don't need a separate `async::BufReader` type, but rather we need to duplicate the `impl<R: Read> BufReader<R>` impl for `R: async::Read` and to implement `async::BufRead` where `R: async::Read` (this might be an area where async overloading is useful).
-
-TODO There's also the question of `seek_relative`.
+I think that we don't need a separate `async::BufReader` type, but rather we need to duplicate the `impl<R: Read> BufReader<R>` impl for `R: async::Read` and to implement `async::BufRead` where `R: async::Read`. Similarly, we would duplicate the `impl<R: Seek> BufReader<R>` impl as `impl<R: async::Seek> BufReader<R>`
+to provide an async versions of `seek_relative`. This might be an area where async overloading is useful.
 
 
 ## Seek
@@ -694,14 +693,13 @@ Although using the readiness and owned APIs is more strongly motivated in async 
 
 ## Requirements discussion
 
-TODO evaluate Seek
-TODO evalute BufRead/OwnedRead, evaluate against requirements (in particular zero-copy support)
-
 ### The traits should be ergonomic to implement and to use
 
 On the plus side, the primary proposal is simple in the simple case (both to use and define) and is as close to symmetric with the non-async traits as possible (assuming we support specialized IO modes at all). It is always possible to use the specialized traits from the basic one, without requiring multiple versions of functions or data types. On the minus side, 'good citizen' libraries do have some extra work to do (mostly unavoidable if we are to support the specialized modes), in particular, optimally implementing a wrapper type requires some work and that work is not enforced or encouraged by the types (i.e., one can just write a naive `read` impl and there is no warning).
 
 The split trait and polling alternatives are more complex and less ergonomic. Implementing the IO traits in the primary proposal is more complex than in the simple async traits alternative, but that does not support optimal performance. All the other tweaks or minor alternatives make the primary proposal more complex or less symmetric.
+
+I believe the `OwnedRead` trait is the most ergonomic solution for efficient completion reads. It closely matches existing solutions from the community, and allows implementing other models (such as the library managing buffers) using `OwnedRead` as a building block.
 
 ### The traits support the same variations as the sync traits
 
@@ -719,6 +717,8 @@ Sometimes it is necessary to permit concurrent reads and writes in generic code.
 
 The traits are usable as trait objects in all variations, assuming that we can support async trait objects in the language.
 
+By using `OwnedBuf` (a concret type), `OwnedRead` is also usable as a trait object (module trait object support for async methods). This would not be the case if using a trait for the buffer type.
+
 ### The traits must work performantly with both readiness- (e.g., epoll) and completion-based systems (e.g., io_uring, IOCP)
 
 The primary proposal addresses this requirement well by providing the specialized traits. The only downside is that there is no guarantee (or static checking) of whether the more performant modes are available.
@@ -726,6 +726,8 @@ The primary proposal addresses this requirement well by providing the specialize
 ### The traits should permit maximum flexibility of buffers
 
 We do not provide a trait where the IO library manages the buffers (in some previous proposals I called this `ManagedRead`). One could use `BufRead` for this, though the API is optimised for tasks which can't be done without buffering, rather than generic reading. One could also implement such a trait in a third-party crate on top of `OwnedRead`. An alternative would be to include such a trait in std. This could be done later. I opted not to for the sake of simplicity.
+
+`OwnedBuf` is designed to be efficiently interoperable with any reasonable buffer type.
 
 ### The traits should work in no_std scenarios
 

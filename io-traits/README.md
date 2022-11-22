@@ -142,13 +142,14 @@ This trait is specialized for readiness IO systems such as epoll.
 
 ```rust
 pub trait Ready {
-    // async
-    fn ready(&mut self, interest: Interest) -> Result<Readiness>;
+    async fn ready(&mut self, interest: Interest) -> Result<Readiness>;
 }
 
-pub trait ReadyRead: Ready + Read {
-    fn non_blocking_read(&mut self, buf: &mut BorrowedCursor<'_>) -> Result<NonBlocking<()>>;
-    fn non_blocking_read_vectored(&mut self, bufs: &mut BorrowedSliceCursor<'_>) -> Result<NonBlocking<usize>> { ... }
+// TODO do we need a trait at all here?
+// TODO does this work?
+pub trait ReadyRead: Ready + Read + std::io::Read {
+    // fn non_blocking_read(&mut self, buf: &mut BorrowedCursor<'_>) -> Result<NonBlocking<()>>;
+    // fn non_blocking_read_vectored(&mut self, bufs: &mut BorrowedSliceCursor<'_>) -> Result<NonBlocking<usize>> { ... }
 }
 
 /// Express which notifications the user is interested in receiving.
@@ -169,7 +170,7 @@ pub enum NonBlocking<T> {
 impl Interest {
     pub const READ = ...;
     pub const WRITE = ...;
-    pub const READ_WRITE = Interest(Interest::Read.0 | Interest::Write.0);
+    pub const READ_WRITE = Interest(Interest::READ.0 | Interest::WRITE.0);
 }
 
 impl Debug for Interest { ... }
@@ -198,7 +199,8 @@ impl Debug for Readiness { ... }
 Notes:
 
 * This approach requires a different idiom for reading, see below. That pattern facilitates avoiding memory allocation before data is ready to read.
-* I'm unclear if we should have convenience async methods including `read`, `read_vectored`, `read_exact`, or `read_to_end`. My thinking for not doing so is that if you want the performance benefits of `ReadyRead` then you probably also want the performance benefits of reading into uninitialized memory (or at least, the ergonomic hit of using `BorrowedCursor` rather than `&mut [u8]` is easy enough to ignore when that is not true).
+* To actually read data, use the synchronous read methods (thus the synchronous `Read` bound on `ReadyRead`). The underlying resource must have been opened in 'async mode' and coded appropriately so that if the operating system returns a 'would block' error, then this is surfaced to the caller, rather than blocking internally (i.e., the reading methods are implemented in a non-blocking fashion).
+
 
 ## Owned read
 
@@ -534,7 +536,7 @@ async fn read_example_ready(reader: &mut impl ReadyRead) -> Result<()> {
         reader.ready(Interest::READABLE).await?;
 
         let mut buf = [0; 1024];
-        if let NonBlocking::Ready(n) = reader.non_blocking_read(buf)? {
+        if let NonBlocking::Ready(n) = std::io::Read::read(reader, buf)? {
             // Use buf
             return Ok(());
         }
@@ -557,7 +559,7 @@ async fn read_example(reader: &mut impl Read) -> Result<()> {
             reader.ready(Interest::READABLE).await?;
 
             let mut buf = [0; 1024];
-            if let NonBlocking::Ready(n) = reader.non_blocking_read(buf)? {
+            if let NonBlocking::Ready(n) = std::io::Read::read(reader, buf)? {
                 // Use buf
                 return Ok(());
             }
@@ -575,9 +577,37 @@ Wrapper traits should implement all traits by dispatching to their inner traits 
 
 ## `Write` proposal
 
-TODO
+`Write` follows `Read` in having a simple trait which is a straightforward async version of the existing sync `Write` trait, and having specialized `ReadyWrite` and `OwnedWrite` traits for optimal performance on readiness and completion systems, respectively.
 
-TODO OwnedWrite
+```rust
+pub trait Write {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize>;
+    async fn flush(&mut self) -> Result<()>;
+    async fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> { ... }
+    fn is_write_vectored(&self) -> bool { ... }
+    async fn write_all(&mut self, buf: &[u8]) -> Result<()> { ... }
+    async fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<()> { ... }
+    async fn write_fmt(&mut self, fmt: Arguments<'_>) -> Result<()> { ... }
+
+    fn by_ref(&mut self) -> &mut Self where Self: Sized { ... }
+}
+
+// TODO does it work? Should we have a trait?
+pub trait ReadyWrite: Ready + Write + std::io::Write {}
+
+// Used for completion model systems.
+pub trait OwnedWrite: Write {
+    async fn write(&mut self, buf: OwnedBuf) -> (OwnedBuf, Result<()>);
+    async fn write_all(&mut self, buf: OwnedBuf) -> (OwnedBuf, Result<()>) { ... }
+}
+```
+
+Notes:
+
+* vectored writes in `OwnedWrite` are left as future work.
+* `OwnedWrite` functions take `OwnedBuf`, not `OwnedCursor` despite an implicit contract that they should not mutate the buffer. This is because ownership must be transferred and `OwnedCursor` borrows from the underlying buffer. Perhaps this indicates poor naming? Perhaps we should have a read-only but owned view of the buffer? This is tricky because once it is returned to the caller, they should be able to mutate it, so this really requires something which doesn't fit with Rust's usual 'ownership implies mutability' principal.
+* See the notes on `ReadyRead`, similar things apply to `ReadyWrite`.
+
 
 ## `BufRead` proposal
 
@@ -602,8 +632,7 @@ pub trait BufRead: Read {
 
 `BufReader` is a concrete type, it's a utility type for converting objects which implement `Read` into objects which implement `BufRead`. I.e., it encapsulates a reader with a buffer to make a reader with an internal buffer. `BufReader` provides its own buffer and does not let the user customise it.
 
-I think that we don't need a separate `async::BufReader` type, but rather we need to duplicate the `impl<R: Read> BufReader<R>` impl for `R: async::Read` and to implement `async::BufRead` where `R: async::Read`. Similarly, we would duplicate the `impl<R: Seek> BufReader<R>` impl as `impl<R: async::Seek> BufReader<R>`
-to provide an async versions of `seek_relative`. This might be an area where async overloading is useful.
+I think that we don't need a separate `async::BufReader` type, but rather we need to duplicate the `impl<R: Read> BufReader<R>` impl for `R: async::Read` and to implement `async::BufRead` where `R: async::Read`. Similarly, we would duplicate the `impl<R: Seek> BufReader<R>` impl as `impl<R: async::Seek> BufReader<R>` to provide an async versions of `seek_relative`. This might be an area where async overloading is useful.
 
 
 ## Seek
@@ -644,6 +673,10 @@ There are several alternatives to the design proposed above. The first few are p
 ### A Split trait
 
 [split-trait.md](alternatives/split-trait.md)
+
+### Tweak: non-blocking read/write methods
+
+Previously, the readiness traits in different proposals had required and provided methods for non-blocking reads/write. We don't think these are necessary because the underlying resources can be opened in non-blocking mode and then the read/write methods of the synchronous `Read`/`Write` traits can be used. H/T TODO cite Yosh's blog post.
 
 ### Tweak: make vectored IO a separate trait
 
